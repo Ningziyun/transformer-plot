@@ -2,21 +2,7 @@
 
 Generate one **2D histogram (Lund plane)** per ROOT file. The script auto-detects the TTree (unless provided), auto-picks two numeric branches (flat or jagged), interprets them semantically as **log(1/ΔR)** and **log(kt)** (or converts from raw ΔR/kt), and saves a heatmap **per file** with a 3-line title.
 
-**Install Dependencies for CPU:**
-```
-python3.13 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-**Install for GPU (not required for this script, optional env setup):**
-```
-conda create --name torch_env python=3.9 -y
-conda activate torch_env
-pip install -r requirements.txt
-```
-
-**requirements.txt**
+**requirements**
 ```
 numpy
 uproot
