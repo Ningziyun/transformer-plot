@@ -50,7 +50,6 @@ def parse_args():
     # Output
     parser.add_argument("--out_dir", type=str, default="plots",
                         help="Directory to save outputs.")
-    # NOTE: out_tag is optional and only used as a *prefix*. The file stem is always appended.
     parser.add_argument("--out_tag", type=str, default="lund2d",
                         help="Output filename prefix. Final filename is <out_tag>_<file-stem>.(png|npz).")
 
@@ -83,6 +82,11 @@ def parse_args():
                         help="Optional note to append on the 3rd title line (e.g., 'epoch=10').")
     parser.add_argument("--cmap", type=str, default="viridis",
                         help="Matplotlib colormap.")
+
+    # New: per-jet emission truncation
+    parser.add_argument("--max_emissions_per_jet", "--maxN", type=int, default=None,
+                        help="If set (e.g. --maxN 20), truncate each jet's emissions to the FIRST N elements "
+                             "before histogramming. Default: use full natural length (no truncation).")
 
     # Misc
     parser.add_argument("--seed", type=int, default=0)
@@ -149,7 +153,6 @@ def _pick_tree_for_file(uf, explicit_tree):
     return uf[tpath], tpath
 
 
-# ---------- robust numeric-array check ----------
 def _is_array_like_branch(tree, bname: str, sample_events: int = 64) -> bool:
     """
     Practical check for numeric branches (works for jagged and flat):
@@ -243,6 +246,29 @@ def _read_two_branches_as_arrays(tree, b1, b2):
     a1 = tree[b1].array(library="ak")
     a2 = tree[b2].array(library="ak")
     return a1, a2
+
+
+def _truncate_per_jet(a: ak.Array, maxN: int) -> ak.Array:
+    """
+    Truncate each jet's emissions to the FIRST maxN elements *if and only if*
+    the array has an inner list axis (per-jet list of emissions).
+
+    Implementation details:
+    - We probe list-ness by calling `ak.num(a, axis=1)`. If this raises, there is no inner list.
+    - If there IS an inner list axis, simply slice `a[:, :maxN]`.
+    - If not list-like, return unchanged (no-op).
+    """
+    if maxN is None:
+        return a
+    if maxN <= 0:
+        raise ValueError("--max_emissions_per_jet must be positive if provided.")
+    try:
+        # This will fail if `a` has no inner list axis.
+        _ = ak.num(a, axis=1)
+    except Exception:
+        return a  # not a per-jet list -> no truncation possible
+    # Safe: truncate along the inner (emission) axis
+    return a[:, :maxN]
 
 
 def _interpret_and_to_logs(first_flat, second_flat, first_kind, second_kind):
@@ -386,30 +412,40 @@ def main():
             # Read as awkward arrays (event-structured)
             a1, a2 = _read_two_branches_as_arrays(tree, b1, b2)
 
+            # --- Per-jet emission truncation (FIRST N elements) ---
+            if args.max_emissions_per_jet is not None:
+                a1 = _truncate_per_jet(a1, args.max_emissions_per_jet)
+                a2 = _truncate_per_jet(a2, args.max_emissions_per_jet)
+
             # Number of jets = number of events (outer dimension)
             n_jets = len(a1)
-            # Flatten to emissions
+
+            # Flatten to emissions (across all jets, after optional truncation)
             first_flat = ak.to_numpy(ak.flatten(a1, axis=None))
             second_flat = ak.to_numpy(ak.flatten(a2, axis=None))
 
-            # Joint finite mask
+            # Joint finite mask (NaN/inf safe) + apply
             mask = np.isfinite(first_flat) & np.isfinite(second_flat)
             first_flat = first_flat[mask]
             second_flat = second_flat[mask]
-            n_emissions = len(first_flat)
 
             # Convert to (X=log(1/dR), Y=log(kt)) by declared kinds
             X, Y = _interpret_and_to_logs(first_flat, second_flat, args.first_kind, args.second_kind)
 
+            # Count emissions AFTER masking (reflects the actual histogrammed stats)
+            n_emissions_after = len(X)
+
             if args.dry_run:
-                print(f"[dry-run] {fpath.name}: jets={n_jets}, emissions={n_emissions}, "
-                      f"tree='{tpath}', first='{b1}', second='{b2}'")
+                print(f"[dry-run] {fpath.name}: jets={n_jets}, emissions(after mask)={n_emissions_after}, "
+                      f"tree='{tpath}', first='{b1}', second='{b2}', maxN={args.max_emissions_per_jet}")
                 continue
 
             # --- Title (3 lines): base title / file stem / stats+extra ---
             line1 = args.title
             line2 = stem
-            line3_bits = [f"norm={args.norm}", f"N_jets={n_jets}", f"N_emissions={n_emissions}"]
+            line3_bits = [f"norm={args.norm}", f"N_jets={n_jets}", f"N_emissions={n_emissions_after}"]
+            if args.max_emissions_per_jet is not None:
+                line3_bits.append(f"maxN={args.max_emissions_per_jet}")
             if args.title_extra:
                 line3_bits.append(args.title_extra)
             title = f"{line1}\n{line2}\n{'; '.join(line3_bits)}"
@@ -429,7 +465,8 @@ def main():
             print(f"[done] {fpath.name} -> saved: {out_npz}")
             print(f"[check] {fpath.name}: sum(H after norm) = {sum_after_norm:.6f} ; "
                   f"emissions in-range (raw) = {int(raw_in_range)} ; "
-                  f"branches: first='{b1}', second='{b2}' ; tree='{tpath}'")
+                  f"branches: first='{b1}', second='{b2}' ; tree='{tpath}' ; "
+                  f"maxN={args.max_emissions_per_jet}")
 
 
 if __name__ == "__main__":
