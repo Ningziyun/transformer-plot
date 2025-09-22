@@ -1,0 +1,3 @@
+InputFiles/log_kt_deltaR_train.h5
+InputFiles/bin_epoch=1.h5InputFiles/bin_epoch=5.h5
+InputFiles/bin_epoch=20.h5InputFiles/bin_epoch=50.h5InputFiles/bin_epoch=100.h5
