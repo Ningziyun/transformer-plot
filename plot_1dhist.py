@@ -73,7 +73,7 @@ def parse_args():
                    help="Scale for y-axis (applies to all figures).")
 
     # Emission cap (per-jet)
-    p.add_argument("--max_emissions", type=int, default=None,
+    p.add_argument("--max_emissions", "--maxN",type=int, default=None,
                    help="If set, truncate each jet's emissions to the first N entries (per-jet).")
 
     return p.parse_args()
