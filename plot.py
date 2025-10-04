@@ -8,15 +8,34 @@ Created on Thu Sep  4 20:30:51 2025
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Compare kt/deltaR or pt/eta/phi distributions across multiple ROOT files,
+and also draw per-file 2D Lund-plane histograms with smart (rich) titles.
+
+Highlights
+----------
+- Title params layout:
+    --title_params_layout {one_line,multi_line}  (default: one_line)
+    --title_param_sep "; "   # separator used when one_line
+- Auto mark differences across many files:
+    (2nd line: file stem in red by default; optional 3rd-line tokens via --mark_line3_diff)
+- Rich title mode (--title_rich) with per-segment color/size/weight and safe auto-fit.
+
+Requirements:
+  pip install uproot awkward numpy matplotlib tqdm
+"""
+
 import argparse
 from pathlib import Path
 import os
 import re
+from typing import Optional, List, Dict, Tuple
 
 import numpy as np
 import uproot
 import awkward as ak
 import matplotlib.pyplot as plt
+from matplotlib.offsetbox import AnchoredOffsetbox, TextArea, HPacker, VPacker
 from tqdm import tqdm
 
 
@@ -25,9 +44,7 @@ from tqdm import tqdm
 # =========================
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Plot a 2D histogram from ROOT TTrees, one plot per file, with optional normalization. "
-                    "Automatically picks the first two array-like branches per file and interprets them "
-                    "according to --first_kind/--second_kind."
+        description="Plot 2D Lund-plane histograms from ROOT TTrees, one plot per file."
     )
     # I/O
     parser.add_argument("--file_list", type=str, default="fileList.txt",
@@ -36,10 +53,6 @@ def parse_args():
                         help="TTree name; use 'auto' to detect per file (searches subdirectories).")
 
     # Semantic interpretation of the FIRST and SECOND selected branches
-    #   - 'logDRinv' : already log(1/deltaR)
-    #   - 'logkt'    : already log(kt)
-    #   - 'deltaR'   : raw deltaR (will be converted to log(1/deltaR))
-    #   - 'kt'       : raw kt (will be converted to log(kt))
     parser.add_argument("--first_kind", type=str, default="logDRinv",
                         choices=["logDRinv", "logkt", "deltaR", "kt"],
                         help="Semantic of the FIRST picked branch (default: logDRinv).")
@@ -64,10 +77,8 @@ def parse_args():
     # Normalization mode
     parser.add_argument("--norm", type=str, default="per_jet",
                         choices=["none", "per_jet", "per_emission"],
-                        help="Normalization: 'none' (raw counts), "
-                             "'per_jet' (counts / #jets), or "
-                             "'per_emission' (counts / #emissions in-range). "
-                             "Default: per_jet.")
+                        help="Z normalization: 'none' (counts), 'per_jet' (counts/#jets), "
+                             "'per_emission' (counts / total counts in-range). Default: per_jet.")
 
     # Z-axis (colorbar) range
     parser.add_argument("--zmin", type=float, default=0.0,
@@ -75,19 +86,58 @@ def parse_args():
     parser.add_argument("--zmax", type=float, default=None,
                         help="Colorbar upper bound. Default auto (max).")
 
-    # Plotting
-    parser.add_argument("--title", type=str, default="QCD Lund Plane",
-                        help="First line of the plot title.")
-    parser.add_argument("--title_extra", type=str, default="",
-                        help="Optional note to append on the 3rd title line (e.g., 'epoch=10').")
+    # Plot setting
     parser.add_argument("--cmap", type=str, default="viridis",
-                        help="Matplotlib colormap.")
+                        help="Matplotlib colormap name, e.g. 'viridis', 'plasma', 'magma'.")
 
-    # New: per-jet emission truncation
+    # Plot title (basic)
+    parser.add_argument("--title", type=str, default="QCD Lund Plane",
+                        help="Base title (1st line).")
+    parser.add_argument("--title_extra", type=str, default="",
+                        help="Optional note appended among the parameter tokens (e.g., 'epoch=10').")
+    parser.add_argument("--title_size", type=float, default=None,
+                        help="Default font size for normal/rich titles (used as base size).")
+
+    # Auto-mark differences in title (default ON)
+    parser.add_argument("--mark_diff", dest="mark_diff", action="store_true", default=True,
+                        help="Highlight differing parts across files (default: on).")
+    parser.add_argument("--no_mark_diff", dest="mark_diff", action="store_false",
+                        help="Disable highlighting differences in titles.")
+    parser.add_argument("--diff_color", type=str, default="red",
+                        help="Color used to highlight differing parts (default: red).")
+    parser.add_argument("--mark_line3_diff", action="store_true",
+                        help="Also color parameter tokens that truly vary across files.")
+
+    # >>> NEW: control how parameter tokens are laid out
+    parser.add_argument("--title_params_layout", type=str,
+                        choices=["one_line", "multi_line"], default="one_line",
+                        help="How to place parameter tokens: "
+                             "'one_line' keeps all tokens on the 3rd line; "
+                             "'multi_line' puts one token per line (lines 3,4,5,...)")
+    parser.add_argument("--title_param_sep", type=str, default="; ",
+                        help="Separator between tokens for 'one_line' layout (default: '; ').")
+
+    # Rich title controls (advanced)
+    parser.add_argument("--title_rich", type=str, default=None,
+                        help=("Rich title: segments separated by ';'. "
+                              "Each segment is 'text|color|size|weight'. "
+                              "Use '\\n' or '<br>' (as a standalone segment) to break line."))
+    parser.add_argument("--title_fig_y", type=float, default=0.985,
+                        help="Vertical anchor (figure coords) for rich title top (0~1).")
+    parser.add_argument("--title_seg_sep", type=float, default=0.0,
+                        help="Horizontal spacing between segments on the same line.")
+    parser.add_argument("--title_line_sep", type=float, default=2.0,
+                        help="Vertical spacing between lines in rich title.")
+    parser.add_argument("--title_width_max_frac", type=float, default=0.95,
+                        help="Max allowed title width fraction of figure width before downscaling.")
+    parser.add_argument("--title_top_pad_frac", type=float, default=0.015,
+                        help="Extra top padding fraction reserved above axes.")
+    parser.add_argument("--title_min_size", type=float, default=6.0,
+                        help="Lower bound for autoscaled font size.")
+
+    # Per-jet emission truncation
     parser.add_argument("--max_emissions_per_jet", "--maxN", type=int, default=None,
-                        help="If set (e.g. --maxN 20), truncate each jet's emissions to the FIRST N elements "
-                             "before histogramming. Default: use full natural length (no truncation).")
-
+                        help="If set, truncate each jet's emissions to the FIRST N per jet.")
     # Misc
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dry_run", action="store_true",
@@ -99,10 +149,9 @@ def parse_args():
 
 
 # =========================
-# Utilities
+# Utilities (I/O & picking)
 # =========================
 def read_file_list(path_txt: str) -> list:
-    """Read a plain text file of filepaths (one per line, '#' for comments)."""
     p = Path(path_txt)
     if not p.exists():
         raise FileNotFoundError(f"file_list not found: {p}")
@@ -118,10 +167,6 @@ def read_file_list(path_txt: str) -> list:
 
 
 def _collect_ttrees(node) -> list:
-    """
-    Recursively collect TTree paths in a File or TDirectory.
-    Returns list of 'path/to/TreeName' without ';cycle'.
-    """
     trees = []
     for k, cls in node.classnames().items():
         base = k.split(";")[0]
@@ -135,11 +180,6 @@ def _collect_ttrees(node) -> list:
 
 
 def _pick_tree_for_file(uf, explicit_tree):
-    """
-    Decide which TTree to use for this file.
-    - If explicit_tree != 'auto', try to open it (supports subdir path).
-    - Else, return the first TTree found (depth-first).
-    """
     if explicit_tree and explicit_tree != "auto":
         try:
             return uf[explicit_tree], explicit_tree
@@ -154,12 +194,7 @@ def _pick_tree_for_file(uf, explicit_tree):
 
 
 def _is_array_like_branch(tree, bname: str, sample_events: int = 64) -> bool:
-    """
-    Practical check for numeric branches (works for jagged and flat):
-    1) Read a small sample as awkward array (entry_stop=sample).
-    2) Flatten to 1D; empty sample counts as acceptable (may be empty early events).
-    3) Convert to numpy and check dtype.kind in {float,int,uint}.
-    """
+    # Practical numeric (flat or jagged) test.
     try:
         n = getattr(tree, "num_entries", 0) or 0
         entry_stop = min(n, sample_events) if n > 0 else None
@@ -176,7 +211,6 @@ def _is_array_like_branch(tree, bname: str, sample_events: int = 64) -> bool:
 
 
 def _debug_branch_signature(tree, limit=50) -> str:
-    """Return a readable list of branch names and (if possible) types, for debugging."""
     items = []
     names = list(tree.keys())
     for b in names[:limit]:
@@ -190,7 +224,6 @@ def _debug_branch_signature(tree, limit=50) -> str:
 
 
 def _name_priority_score(name: str) -> int:
-    """Heuristic priority for kt/deltaR-like names when we must guess."""
     s = name.lower()
     score = 0
     if re.search(r"\bkt\b", s) or "logkt" in s:
@@ -205,22 +238,13 @@ def _name_priority_score(name: str) -> int:
 
 
 def _pick_first_two_array_branches(tree, debug=False) -> list:
-    """
-    Pick two numeric (flat or jagged) branches.
-    Strategy:
-      (A) Sample-based filter.
-      (B) If <2, rank by name heuristics.
-      (C) If still <2, raise with a diagnostic list.
-    """
     names = list(tree.keys())
     good = [b for b in names if _is_array_like_branch(tree, b)]
-
     if len(good) >= 2:
         picked = good[:2]
         if debug:
             print(f"[debug] sample-picked branches: {picked}")
         return picked
-
     ranked = sorted(names, key=lambda n: _name_priority_score(n), reverse=True)
     picked = []
     for b in ranked:
@@ -230,55 +254,39 @@ def _pick_first_two_array_branches(tree, debug=False) -> list:
                 if debug:
                     print(f"[debug] heuristic-picked branches: {picked}")
                 return picked
-
     sig = _debug_branch_signature(tree)
     raise RuntimeError(
         "Could not find two array-like (numeric) branches to read.\n"
         "Here are some branches and types (first 50):\n"
         f"{sig}\n"
-        "Tip: If your numeric data are stored as objects/strings, export numeric arrays; "
-        "or pass an explicit --tree_name pointing to the intended TTree."
+        "Tip: pass an explicit --tree_name or export numeric arrays."
     )
 
 
+# =========================
+# Array transforms
+# =========================
 def _read_two_branches_as_arrays(tree, b1, b2):
-    """Read two branches as awkward arrays (may be jagged) and return them."""
     a1 = tree[b1].array(library="ak")
     a2 = tree[b2].array(library="ak")
     return a1, a2
 
 
-def _truncate_per_jet(a: ak.Array, maxN: int) -> ak.Array:
-    """
-    Truncate each jet's emissions to the FIRST maxN elements *if and only if*
-    the array has an inner list axis (per-jet list of emissions).
-
-    Implementation details:
-    - We probe list-ness by calling `ak.num(a, axis=1)`. If this raises, there is no inner list.
-    - If there IS an inner list axis, simply slice `a[:, :maxN]`.
-    - If not list-like, return unchanged (no-op).
-    """
+def _truncate_per_jet(a: ak.Array, maxN: Optional[int]) -> ak.Array:
     if maxN is None:
         return a
     if maxN <= 0:
         raise ValueError("--max_emissions_per_jet must be positive if provided.")
     try:
-        # This will fail if `a` has no inner list axis.
         _ = ak.num(a, axis=1)
     except Exception:
-        return a  # not a per-jet list -> no truncation possible
-    # Safe: truncate along the inner (emission) axis
+        return a
     return a[:, :maxN]
 
 
 def _interpret_and_to_logs(first_flat, second_flat, first_kind, second_kind):
-    """
-    Map flattened arrays to (X, Y) where:
-      X := log(1/deltaR)
-      Y := log(kt)
-    """
-    X = None
-    Y = None
+    X = None  # log(1/dR)
+    Y = None  # log(kt)
     eps = 1e-12
 
     def to_logDRinv(x):
@@ -289,7 +297,6 @@ def _interpret_and_to_logs(first_flat, second_flat, first_kind, second_kind):
         y = np.clip(y, eps, None)
         return np.log(y)
 
-    # FIRST maps to either X or Y depending on declared kind
     if first_kind == "logDRinv":
         X = first_flat
     elif first_kind == "logkt":
@@ -299,7 +306,6 @@ def _interpret_and_to_logs(first_flat, second_flat, first_kind, second_kind):
     elif first_kind == "kt":
         Y = to_logkt(first_flat)
 
-    # SECOND fills the remaining one
     if second_kind == "logDRinv":
         X = second_flat if X is None else X
     elif second_kind == "logkt":
@@ -310,26 +316,132 @@ def _interpret_and_to_logs(first_flat, second_flat, first_kind, second_kind):
         Y = to_logkt(second_flat) if Y is None else Y
 
     if X is None or Y is None:
-        raise ValueError("Ambiguous kinds: could not derive both X=log(1/ΔR) and Y=log(kt). "
-                         f"Got first_kind={first_kind}, second_kind={second_kind}")
+        raise ValueError("Ambiguous kinds: could not derive both X=log(1/ΔR) and Y=log(kt).")
     return X, Y
 
 
 # =========================
-# Plotting
+# Rich title helpers
+# =========================
+def _build_title_box_from_lines(lines: List[List[Dict]],
+                                seg_sep: float, line_sep: float,
+                                default_size: Optional[float],
+                                size_scale: float = 1.0,
+                                min_size: float = 6.0):
+    """Build an OffsetBox directly from structured lines/segments."""
+    def seg_textarea(seg: Dict):
+        props = {}
+        if seg.get("color"):  props["color"] = seg["color"]
+        if seg.get("weight"): props["weight"] = seg["weight"]
+        fsz = seg.get("size", default_size)
+        if fsz is not None:
+            props["size"] = max(min_size, float(fsz) * size_scale)
+        return TextArea(seg.get("text", ""), textprops=props)
+
+    line_boxes = []
+    for line in lines:
+        items = [seg_textarea(seg) for seg in line]
+        line_boxes.append(HPacker(children=items, align="center", pad=0, sep=seg_sep))
+    return line_boxes[0] if len(line_boxes) == 1 else VPacker(children=line_boxes, align="center", pad=0, sep=line_sep)
+
+
+def _parse_rich_spec(spec: str, default_size: Optional[float]) -> List[List[Dict]]:
+    """
+    Parse 'text|color|size|weight' segments into lines of segment dicts.
+    IMPORTANT: Only '\\n' or '<br>' are treated as explicit newlines (empty token is NOT a newline).
+    """
+    def is_newline(tok: str) -> bool:
+        t = tok.strip().lower()
+        return t in ("\\n", "<br>")
+
+    lines, cur = [], []
+    for raw in spec.split(";"):
+        tok = raw  # do not strip here to preserve leading/trailing spaces if intended
+        if is_newline(tok):
+            if cur or not lines:
+                lines.append(cur)
+                cur = []
+            continue
+        parts = tok.split("|")
+        text = parts[0] if len(parts) > 0 else ""
+        color = parts[1] if len(parts) > 1 and parts[1] else None
+        try:
+            size = float(parts[2]) if len(parts) > 2 and parts[2] else default_size
+        except Exception:
+            size = default_size
+        weight = parts[3] if len(parts) > 3 and parts[3] else None
+        cur.append({"text": text, "color": color, "size": size, "weight": weight})
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _add_rich_title_lines(fig,
+                          lines: List[List[Dict]],
+                          default_size: Optional[float],
+                          y: float,
+                          seg_sep: float,
+                          line_sep: float,
+                          width_max_frac: float,
+                          top_pad_frac: float,
+                          min_size: float):
+    """
+    Render a rich title from pre-built line/segment structures (no string parsing),
+    auto-fitting width and reserving top margin.
+    """
+    if not lines:
+        return
+    box = _build_title_box_from_lines(lines, seg_sep, line_sep, default_size, size_scale=1.0, min_size=min_size)
+    anch = AnchoredOffsetbox(loc="upper center", child=box, pad=0.0,
+                             bbox_to_anchor=(0.5, y), bbox_transform=fig.transFigure, frameon=False)
+    fig.add_artist(anch)
+    fig.canvas.draw()
+    bb = box.get_window_extent(fig.canvas.get_renderer())
+    fig_w, fig_h = fig.bbox.width, fig.bbox.height
+    width_frac = bb.width / fig_w
+    if width_frac > width_max_frac:
+        scale = width_max_frac / max(width_frac, 1e-9)
+        fig.artists.remove(anch)
+        box = _build_title_box_from_lines(lines, seg_sep, line_sep, default_size,
+                                          size_scale=scale, min_size=min_size)
+        anch = AnchoredOffsetbox(loc="upper center", child=box, pad=0.0,
+                                 bbox_to_anchor=(0.5, y), bbox_transform=fig.transFigure, frameon=False)
+        fig.add_artist(anch)
+        fig.canvas.draw()
+        bb = box.get_window_extent(fig.canvas.get_renderer())
+    height_frac = bb.height / fig_h
+    top_rect = max(0.0, 1.0 - height_frac - top_pad_frac)
+    plt.tight_layout(rect=[0, 0, 1, top_rect])
+
+
+def _add_rich_title_spec(fig,
+                         spec: str,
+                         default_size: Optional[float],
+                         y: float,
+                         seg_sep: float,
+                         line_sep: float,
+                         width_max_frac: float,
+                         top_pad_frac: float,
+                         min_size: float):
+    """Render a rich title from a spec string (kept for --title_rich)."""
+    lines = _parse_rich_spec(spec, default_size)
+    _add_rich_title_lines(fig, lines, default_size, y, seg_sep, line_sep,
+                          width_max_frac, top_pad_frac, min_size)
+
+
+# =========================
+# 2D histogram + saving
 # =========================
 def plot_2d_hist(
     x, y, n_jets, xbins, ybins, xrange_, yrange_,
-    title, cmap, out_png, out_npz, norm_mode="per_jet",
+    title_payload, use_rich_lines, fig_args, cmap, out_png, out_npz, norm_mode="per_jet",
     zmin=0.0, zmax=None
 ):
     """
-    Build a 2D histogram H(x,y). Apply normalization according to norm_mode:
-      - 'none'        : H stays as raw counts.
-      - 'per_jet'     : H /= n_jets                  (counts per jet).
-      - 'per_emission': H /= H.sum() (in-range only) (probability per emission).
-    Save PNG and NPZ (edges + normalized H).
-    Returns (sum_of_H_after_norm, raw_total_emissions_in_range).
+    Build a 2D histogram H(x,y). Normalize and save.
+    Title:
+      - if use_rich_lines=True: `title_payload` is List[List[Dict]] lines.
+      - else: `title_payload` is a rich-spec string (for --title_rich) or a plain str.
     """
     if norm_mode == "per_jet" and n_jets <= 0:
         raise ValueError("n_jets must be positive to normalize per jet.")
@@ -354,32 +466,56 @@ def plot_2d_hist(
         zlabel = "counts"
 
     # Plot
-    plt.figure(figsize=(7.8, 6.6))
+    fig = plt.figure(figsize=(7.8, 6.6))
     mesh = plt.pcolormesh(
         xedges, yedges, Hn.T,
         shading="auto", cmap=cmap, vmin=zmin, vmax=zmax
     )
-    cbar = plt.colorbar(mesh)
-    cbar.set_label(zlabel)
+    cbar = plt.colorbar(mesh); cbar.set_label(zlabel)
+    plt.xlabel("log(1/ΔR)"); plt.ylabel("log(kt)")
 
-    plt.xlabel("log(1/ΔR)")
-    plt.ylabel("log(kt)")
-    plt.title(title)
+    # Title
+    if use_rich_lines:
+        _add_rich_title_lines(
+            fig,
+            lines=title_payload,
+            default_size=fig_args["title_size"],
+            y=fig_args["title_fig_y"],
+            seg_sep=fig_args["title_seg_sep"],
+            line_sep=fig_args["title_line_sep"],
+            width_max_frac=fig_args["title_width_max_frac"],
+            top_pad_frac=fig_args["title_top_pad_frac"],
+            min_size=fig_args["title_min_size"],
+        )
+    else:
+        if isinstance(title_payload, str) and ("|" in title_payload or "\\n" in title_payload or "<br>" in title_payload):
+            _add_rich_title_spec(
+                fig,
+                spec=title_payload,
+                default_size=fig_args["title_size"],
+                y=fig_args["title_fig_y"],
+                seg_sep=fig_args["title_seg_sep"],
+                line_sep=fig_args["title_line_sep"],
+                width_max_frac=fig_args["title_width_max_frac"],
+                top_pad_frac=fig_args["title_top_pad_frac"],
+                min_size=fig_args["title_min_size"],
+            )
+        else:
+            plt.title(str(title_payload))
+            plt.tight_layout()
 
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
-    plt.tight_layout()
     plt.savefig(out_png, dpi=200)
-    plt.close()
+    plt.close(fig)
 
     # Save arrays
     np.savez(out_npz, H=Hn, xedges=xedges, yedges=yedges,
              norm_mode=norm_mode, raw_emissions_in_range=raw_emissions_in_range)
-
     return Hn.sum(), raw_emissions_in_range
 
 
 # =========================
-# Main (one plot per file)
+# Main
 # =========================
 def main():
     args = parse_args()
@@ -387,86 +523,143 @@ def main():
 
     files = read_file_list(args.file_list)
     print(f"[files] {len(files)} files from {args.file_list}")
+    out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    multi = len(files) > 1
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # ---------- First pass: collect per-file metadata for "diff" detection ----------
+    metas = []
+    for f in tqdm(files, desc="Scanning files for title info"):
+        with uproot.open(f) as uf:
+            tree, _ = _pick_tree_for_file(uf, args.tree_name)
+            b1, b2 = _pick_first_two_array_branches(tree, debug=args.debug)
+            a1, a2 = _read_two_branches_as_arrays(tree, b1, b2)
+            if args.max_emissions_per_jet is not None:
+                a1 = _truncate_per_jet(a1, args.max_emissions_per_jet)
+                a2 = _truncate_per_jet(a2, args.max_emissions_per_jet)
+            n_jets = len(a1)
+            first_flat = ak.to_numpy(ak.flatten(a1, axis=None))
+            second_flat = ak.to_numpy(ak.flatten(a2, axis=None))
+            mask = np.isfinite(first_flat) & np.isfinite(second_flat)
+            first_flat = first_flat[mask]; second_flat = second_flat[mask]
+            X, Y = _interpret_and_to_logs(first_flat, second_flat, args.first_kind, args.second_kind)
+            metas.append({
+                "path": f,
+                "stem": Path(f).stem,
+                "n_jets": n_jets,
+                "n_emit": len(X),
+                "b1": b1, "b2": b2
+            })
 
-    # Iterate over files and produce one plot per file
-    for f in tqdm(files, desc="Processing files"):
-        fpath = Path(f)
-        stem = fpath.stem  # filename without suffix
+    # Which tokens really vary across files?
+    varying = {"norm": False, "N_jets": False, "N_emissions": False, "maxN": False, "extra": False}
+    if multi:
+        if len({m["n_jets"] for m in metas}) > 1: varying["N_jets"] = True
+        if len({m["n_emit"] for m in metas}) > 1: varying["N_emissions"] = True
+        # run-level options are typically constant in one run
+        varying["norm"]  = False
+        varying["maxN"]  = False
+        varying["extra"] = False if not args.title_extra else False
+
+    # ---------- Second pass: actually plot ----------
+    for m in tqdm(metas, desc="Plotting files"):
+        f = m["path"]; stem = m["stem"]
+
         out_tag = f"{args.out_tag}_{stem}" if args.out_tag else f"lund2d_{stem}"
         out_png = str(out_dir / f"{out_tag}.png")
         out_npz = str(out_dir / f"{out_tag}.npz")
 
         with uproot.open(f) as uf:
             tree, tpath = _pick_tree_for_file(uf, args.tree_name)
-
-            if args.debug:
-                print(f"[debug] Branch summary for {fpath.name} (tree='{tpath}'):\n"
-                      f"{_debug_branch_signature(tree)}")
-
-            # Pick two numeric branches
-            b1, b2 = _pick_first_two_array_branches(tree, debug=args.debug)
-
-            # Read as awkward arrays (event-structured)
+            b1, b2 = _pick_first_two_array_branches(tree, debug=False)
             a1, a2 = _read_two_branches_as_arrays(tree, b1, b2)
-
-            # --- Per-jet emission truncation (FIRST N elements) ---
             if args.max_emissions_per_jet is not None:
                 a1 = _truncate_per_jet(a1, args.max_emissions_per_jet)
                 a2 = _truncate_per_jet(a2, args.max_emissions_per_jet)
 
-            # Number of jets = number of events (outer dimension)
             n_jets = len(a1)
-
-            # Flatten to emissions (across all jets, after optional truncation)
             first_flat = ak.to_numpy(ak.flatten(a1, axis=None))
             second_flat = ak.to_numpy(ak.flatten(a2, axis=None))
-
-            # Joint finite mask (NaN/inf safe) + apply
             mask = np.isfinite(first_flat) & np.isfinite(second_flat)
-            first_flat = first_flat[mask]
-            second_flat = second_flat[mask]
-
-            # Convert to (X=log(1/dR), Y=log(kt)) by declared kinds
+            first_flat = first_flat[mask]; second_flat = second_flat[mask]
             X, Y = _interpret_and_to_logs(first_flat, second_flat, args.first_kind, args.second_kind)
-
-            # Count emissions AFTER masking (reflects the actual histogrammed stats)
-            n_emissions_after = len(X)
+            n_emit = len(X)
 
             if args.dry_run:
-                print(f"[dry-run] {fpath.name}: jets={n_jets}, emissions(after mask)={n_emissions_after}, "
+                print(f"[dry-run] {Path(f).name}: jets={n_jets}, emissions(after mask)={n_emit}, "
                       f"tree='{tpath}', first='{b1}', second='{b2}', maxN={args.max_emissions_per_jet}")
                 continue
 
-            # --- Title (3 lines): base title / file stem / stats+extra ---
-            line1 = args.title
-            line2 = stem
-            line3_bits = [f"norm={args.norm}", f"N_jets={n_jets}", f"N_emissions={n_emissions_after}"]
-            if args.max_emissions_per_jet is not None:
-                line3_bits.append(f"maxN={args.max_emissions_per_jet}")
-            if args.title_extra:
-                line3_bits.append(args.title_extra)
-            title = f"{line1}\n{line2}\n{'; '.join(line3_bits)}"
+            # ----- Build title -----
+            fig_args = dict(
+                title_size=args.title_size,
+                title_fig_y=args.title_fig_y,
+                title_seg_sep=args.title_seg_sep,
+                title_line_sep=args.title_line_sep,
+                title_width_max_frac=args.title_width_max_frac,
+                title_top_pad_frac=args.title_top_pad_frac,
+                title_min_size=args.title_min_size,
+            )
 
-            # --- Plot & save for this file ---
+            if args.title_rich:
+                # Use user-provided rich spec string verbatim.
+                title_payload = args.title_rich
+                use_rich_lines = False
+            else:
+                # Build structured lines so we can safely include separators like '; '
+                lines: List[List[Dict]] = []
+
+                # Line 1: base title (bold)
+                lines.append([{"text": args.title, "weight": "bold"}])
+
+                # Line 2: file stem (red if multi & mark_diff)
+                color_stem = args.diff_color if (multi and args.mark_diff) else None
+                lines.append([{"text": stem, "color": color_stem}])
+
+                # Line 3 (or multi lines): parameters
+                tokens = []
+                tokens.append(("norm",        f"norm={args.norm}"))
+                tokens.append(("N_jets",      f"N_jets={n_jets}"))
+                tokens.append(("N_emissions", f"N_emissions={n_emit}"))
+                if args.max_emissions_per_jet is not None:
+                    tokens.append(("maxN", f"maxN={args.max_emissions_per_jet}"))
+                if args.title_extra:
+                    tokens.append(("extra", args.title_extra))
+
+                if args.title_params_layout == "one_line":
+                    line3: List[Dict] = []
+                    for i, (key, text) in enumerate(tokens):
+                        color = args.diff_color if (args.mark_diff and args.mark_line3_diff and varying.get(key, False)) else None
+                        line3.append({"text": text, "color": color})
+                        if i != len(tokens) - 1:
+                            # separator stays literal (e.g., '; ') and does NOT trigger parsing issues
+                            line3.append({"text": args.title_param_sep})
+                    lines.append(line3)
+                else:
+                    # multi_line: one token per line
+                    for (key, text) in tokens:
+                        color = args.diff_color if (args.mark_diff and args.mark_line3_diff and varying.get(key, False)) else None
+                        lines.append([{"text": text, "color": color}])
+
+                title_payload = lines
+                use_rich_lines = True
+
             sum_after_norm, raw_in_range = plot_2d_hist(
                 x=X, y=Y, n_jets=n_jets,
                 xbins=args.xbins, ybins=args.ybins,
                 xrange_=tuple(args.xrange) if args.xrange else None,
                 yrange_=tuple(args.yrange) if args.yrange else None,
-                title=title, cmap=args.cmap,
+                title_payload=title_payload,
+                use_rich_lines=use_rich_lines,
+                fig_args=fig_args,
+                cmap=args.cmap,
                 out_png=out_png, out_npz=out_npz,
                 norm_mode=args.norm, zmin=args.zmin, zmax=args.zmax,
             )
 
-            print(f"[done] {fpath.name} -> saved: {out_png}")
-            print(f"[done] {fpath.name} -> saved: {out_npz}")
-            print(f"[check] {fpath.name}: sum(H after norm) = {sum_after_norm:.6f} ; "
-                  f"emissions in-range (raw) = {int(raw_in_range)} ; "
-                  f"branches: first='{b1}', second='{b2}' ; tree='{tpath}' ; "
-                  f"maxN={args.max_emissions_per_jet}")
+            print(f"[done] {Path(f).name} -> {out_png}")
+            print(f"[done] {Path(f).name} -> {out_npz}")
+            print(f"[check] sum(H after norm)={sum_after_norm:.6f} ; emissions in-range={int(raw_in_range)} ; "
+                  f"branches: '{b1}', '{b2}' ; tree='{tpath}' ; maxN={args.max_emissions_per_jet}")
 
 
 if __name__ == "__main__":

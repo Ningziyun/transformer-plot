@@ -66,7 +66,7 @@ def parse_args():
     p.add_argument("--title_size", type=float, default=None,
                    help="Font size for the normal title and as default for rich segments.")
 
-    # 富文本标题：分段 + 可换行 + 自动缩放 + 自动留白
+    # title_rich: paragraph + line break + automatic scaling + automatic white space
     p.add_argument("--title_rich", type=str, default=None,
                    help=("Rich title: segments separated by ';'. "
                          "Each segment is 'text|color|size|weight'. "
