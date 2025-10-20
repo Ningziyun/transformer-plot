@@ -61,7 +61,7 @@ def parse_args():
     # ---- Title controls (normal & rich) ----
     p.add_argument("--title", type=str, default="Loss vs. Epoch",
                    help="Figure title (ignored if --title_rich is provided).")
-    p.add_argument("--title_color", type=str, default=None,
+    p.add_argument("--title_color", type=str, default="Black",
                    help="Color for the whole title (ignored if --title_rich is provided).")
     p.add_argument("--title_size", type=float, default=None,
                    help="Font size for the normal title and as default for rich segments.")
